@@ -57,12 +57,11 @@ class Synchronizer(object):
 
         return None
 
-    def get_table_names(self, schema: str, rel_type: str = "table") -> set:
-        """Get the table names for a given schema.
+    def get_table_names(self, schema: str) -> set:
+        """Get the table/view names for a given schema.
 
         Args:
             schema (str): the name of the schema to search
-            rel_type (str, optional): the relation type, must be one of `view` or `table`
 
         Returns:
             set: the set of distinct table names (or view names) in the schema, returns empty set
@@ -73,16 +72,12 @@ class Synchronizer(object):
             return table_names
 
         query = sql.SQL(
-            """SELECT table_schema || '.' || table_name AS rel_name
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE';"""
-        ).format(sql.Literal(schema))
-
-        if rel_type is not "table":
-            query = sql.SQL(
-                """SELECT table_schema || '.' || table_name AS rel_name
-                FROM information_schema.views WHERE table_schema = %s"""
-            ).format(sql.Literal(schema))
+            """SELECT table_schema || '.' || table_name AS rel_name FROM information_schema.tables
+            WHERE table_schema = {schema} AND table_type = 'BASE TABLE'
+            UNION
+            SELECT table_schema || '.' || table_name AS rel_name FROM information_schema.views WHERE table_schema = {schema};
+            """
+        ).format(schema=sql.Literal(schema))
 
         with self.connection.cursor() as cursor:
             cursor.execute(query)
@@ -105,34 +100,14 @@ class Synchronizer(object):
         if not self._is_connected():
             return column_names
 
-        query = sql.SQL("SELECT * FROM {} WHERE false;").format(
+        query = sql.SQL("SELECT * FROM {} WHERE False;").format(
             sql.Identifier(table_name)
         )
         with self.connection.cursor() as cursor:
             cursor.execute(query)
-            column_names = set(desc[0] for desc in cursor.description)
+            column_names = set(desc.name for desc in cursor.description)
 
         return column_names
-
-    def create_temp_schema(self) -> bool:
-        """Create a temporary schema where the syncing will be done.
-        
-        Returns:
-            bool: return True if the temporary schema was successfully created, false otherwise.
-        """
-        if not self._is_connected():
-            return False
-
-        schema = sql.Identifier(self.__temp_schema)
-        query = sql.SQL(
-            "DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA IF NOT EXISTS {};"
-        ).format(schema, schema)
-
-        with self.connection.cursor() as cursor:
-            cursor.execute(query)
-
-        self.connection.commit()
-        return True
 
     def is_compatible(self, source_table: str, destination_table: str) -> bool:
         """Check if two tables can be merged. Two tables are compatible if they both
@@ -161,56 +136,72 @@ class Synchronizer(object):
 
         return False
 
-    def copy_table(
-        self, source_table: str, destination_table: str, overwrite: bool = False
-    ):
-        """Copy a table or view from one schema to another.
+    def exists(self, table_name: str) -> bool:
+        """Check if a given table exists. The table name should be in the form
+        `schema_name`.`table_name`
 
         Args:
-            source_table (str): the source table to copy from.
-            destination_table (str): the destination table.
-            overwrite (bool): a boolean indicating whether or not overwriting existing
-                table is allowed.
+            table_name (str): the name of the table (prefixed by the table schema).
+        
+        Returns:
+            bool: True if the table exists, False otherwise.
+        
+        Raises:
+            ValueError: raised when table name is invalid
         """
-        source = sql.Identifier(source_table)
-        destination = sql.Identifier(destination_table)
-        query = sql.SQL("CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {};").format(
-            destination, source
-        )
+        if "." not in table_name:
+            raise ValueError(
+                "table_name must be a full relation name in the form `schema`.`table`."
+            )
 
-        if overwrite:
-            query = sql.SQL(
-                "DROP TABLE IF EXISTS {} CASCADE; CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {};"
-            ).format(destination, destination, source)
+        schema, table = [sql.Literal(i) for i in table_name.split(".")]
+        query = sql.SQL(
+            """
+            SELECT * FROM information_schema.tables WHERE table_schema = {} AND table_name = {};
+            """
+        ).format(schema, table)
 
         with self.connection.cursor() as cursor:
             cursor.execute(query)
+            return cursor.rowcount > 0
 
-        self.connection.commit()
+    def copy_table(self, source_table: str, target_table: str, overwrite: bool = False):
+        """Copy a table or view from one schema to another. If the target table exists
+        do an UPSERT.
 
-    def copy_data(self, source_table: str, destination_table: str):
-        """Copy data from a table or view in one schema to a table in another schema.
-        
         Args:
             source_table (str): the source table to copy from.
-            destination_table (str): the destination table.
+            target_table (str): the destination table.
+            overwrite (bool): indicates whether to override existing table or not.
         """
-        if not self.is_compatible(source_table, destination_table):
-            log.info(
-                f"{source_table} and {destination_table} are not compatible, skipping."
-            )
-            return
-
-        column_names = self.get_column_names(destination_table)
-        globalid = sql.Identifier(
-            "globalid" if "globalid" in column_names else "global_id"
-        )
-        columns = sql.SQL(", ").join(sql.Identifier(c) for c in column_names)
         source = sql.Identifier(source_table)
-        destination = sql.Identifier(destination_table)
-        query = sql.SQL(
-            "INSERT INTO {} ({}) SELECT {} FROM {} WHERE {} NOT IN (SELECT DISTINCT {} FROM {});"
-        ).format(destination, columns, columns, source, globalid, globalid, destination)
+        target = sql.Identifier(target_table)
+        query = sql.SQL("CREATE TABLE {} AS SELECT * FROM {};").format(target, source)
+
+        if self.exists(target_table):
+            if self.is_compatible(source_table, target_table):
+                column_names = self.get_column_names(target_table)
+                guid = sql.Identifier(
+                    "globalid" if "globalid" in column_names else "global_id"
+                )
+                columns = sql.SQL(", ").join(sql.Identifier(c) for c in column_names)
+                query = sql.SQL(
+                    """INSERT INTO {target} ({columns}) SELECT {columns} FROM {source}
+                    ON CONFLICT ({guid}) DO UPDATE SET {guid} = EXCLUDED.{guid};"""
+                ).format(source=source, target=target, columns=columns, guid=guid)
+            else:
+                if not overwrite:
+                    log.warning(
+                        (
+                            "The target table exists but is not compatible with the "
+                            "source table. If you wish to overwrite the table set "
+                            f"`overwrite` to True. Source: {source_table} Target: {target_table}."
+                        )
+                    )
+                    return
+                query = sql.SQL(
+                    "DROP TABLE {target} CASCADE; CREATE TABLE {target} AS SELECT * FROM {source};"
+                ).format(source=source, target=target)
 
         with self.connection.cursor() as cursor:
             cursor.execute(query)
@@ -220,43 +211,22 @@ class Synchronizer(object):
     def synchronize(self):
         """Run the schema synchronization operation on the schemas."""
         try:
-            # create a temporary schema
-            log.info(
-                f"Creating a temporary schema with the name: {self.__temp_schema}."
-            )
-            created = self.create_temp_schema()
-            if not created:
-                raise Exception("Cannot create temp schema, quitting...")
+            log.info(f"Copying data from schema {self.source!r} to {self.target!r}.")
 
-            log.info(
-                f"Copying existing data in the target schema `{self.target}` to the temporary schema."
-            )
-            for table in self.get_table_names(self.target):
-                table_name = table.split(".")[-1]
-                destination_table = ".".join([self.__temp_schema, table_name])
+            for source_table in self.get_table_names(self.source):
+                table_name = source_table.split(".")[-1]
+                target_table = ".".join([self.target, table_name])
 
-                # copy the data in the destination views to the temporary schema
-                log.info(
-                    f"Copying view {table} into table `{destination_table}` in the temporary schema."
-                )
-                self.copy_table(table, destination_table, overwrite=True)
+                try:
+                    log.info(f"Copying {source_table!r} into {target_table!r}.")
+                    self.copy_table(source_table, target_table, overwrite=True)
+                except Exception as e:
+                    log.error(
+                        f"Failed to copy {source_table!r} into {target_table!r}",
+                        exc_info=True,
+                    )
 
-                # copy data which currently exist in the source schema but not in the
-                # destination schema into the temporary schema
-                source_table = ".".join([self.source, table_name])
-                log.info(
-                    f"Copying new data from source view {source_table} into table `{destination_table}` in the temporary schema."
-                )
-                self.copy_data(source_table, destination_table)
-
-                # @todo: should we delete source and target schema? should we rename temporary schema?
-
-            log.info(
-                (
-                    f"The data in the source schema `{self.source}` and target schema `{self.target}`",
-                    f" have been successfully merged into a new schema with name `{self.__temp_schema}`.",
-                )
-            )
+            log.info(f"Schema {self.source!r} has been merged into {self.target!r}.")
 
         except Exception as e:
             log.error(e)

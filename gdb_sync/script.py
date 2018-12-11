@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 import logging
-import math
 import os
-import time
 
 import psycopg2
 import psycopg2.sql as sql
-from psycopg2.extras import NamedTupleCursor
 
 log = logging.getLogger(__name__)
 
@@ -25,11 +22,11 @@ class Synchronizer(object):
         target (str): the target schema.
     """
 
+    __slots__ = ("__pgconn", "_dsn", "source", "target")
+
     def __init__(self, source_schema: str, target_schema: str, db_uri: str = None):
-        timestamp = math.floor(time.time())
         self.source = source_schema.lower()
         self.target = target_schema.lower()
-        self.__temp_schema = f"gdb_sync_temp_{timestamp}"
         self._dsn = db_uri or os.getenv("DATABASE_URI")
 
     def _is_connected(self) -> bool:
@@ -42,6 +39,10 @@ class Synchronizer(object):
 
         return False
 
+    def _to_identifier(self, table_name: str) -> sql.Composable:
+        """Convert a table name to a valid table identifier"""
+        return sql.SQL(".").join(sql.Identifier(i) for i in table_name.split("."))
+
     @property
     def connection(self) -> psycopg2.extensions.connection:
         """psycopg2.extensions.connection: database connection object"""
@@ -50,7 +51,7 @@ class Synchronizer(object):
             return pgconn
 
         try:
-            self.__pgconn = psycopg2.connect(self._dsn, cursor_factory=NamedTupleCursor)
+            self.__pgconn = psycopg2.connect(self._dsn)
             return self.__pgconn
         except Exception as e:
             log.error(e)
@@ -82,7 +83,7 @@ class Synchronizer(object):
         with self.connection.cursor() as cursor:
             cursor.execute(query)
             for row in cursor.fetchall():
-                table_names.add(row.rel_name)
+                table_names.add(row[0])
 
         return table_names
 
@@ -101,11 +102,11 @@ class Synchronizer(object):
             return column_names
 
         query = sql.SQL("SELECT * FROM {} WHERE False;").format(
-            sql.Identifier(table_name)
+            self._to_identifier(table_name)
         )
         with self.connection.cursor() as cursor:
             cursor.execute(query)
-            column_names = set(desc.name for desc in cursor.description)
+            column_names = set(col[0] for col in cursor.description)
 
         return column_names
 
@@ -174,8 +175,8 @@ class Synchronizer(object):
             target_table (str): the destination table.
             overwrite (bool): indicates whether to override existing table or not.
         """
-        source = sql.Identifier(source_table)
-        target = sql.Identifier(target_table)
+        source = self._to_identifier(source_table)
+        target = self._to_identifier(target_table)
         query = sql.SQL("CREATE TABLE {} AS SELECT * FROM {};").format(target, source)
 
         if self.exists(target_table):
@@ -204,9 +205,19 @@ class Synchronizer(object):
                 ).format(source=source, target=target)
 
         with self.connection.cursor() as cursor:
+            log.debug(query.as_string(self.connection))
             cursor.execute(query)
 
-        self.connection.commit()
+    def close(self):
+        """Cleanup database connections"""
+        should_close = (
+            isinstance(self.connection, psycopg2.extensions.connection)
+            and not self.connection.closed
+        )
+        if should_close:
+            self.connection.commit()
+            self.connection.close()
+            del self.__pgconn
 
     def synchronize(self):
         """Run the schema synchronization operation on the schemas."""
@@ -230,6 +241,8 @@ class Synchronizer(object):
 
         except Exception as e:
             log.error(e)
+        finally:
+            self.close()
 
 
 def synchronize(source_schema, target_schema, db_uri=None):

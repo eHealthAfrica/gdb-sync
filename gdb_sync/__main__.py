@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import argparse
+import logging
 
 from gdb_sync.script import synchronize
 
@@ -15,6 +16,14 @@ def get_version():
         pass
 
     return "dev"
+
+
+def schema_sync(args):
+    if args.verbose:
+        # set log level of root logger to debug
+        logging.root.setLevel(logging.DEBUG)
+
+    synchronize(args.source, args.target, db_uri=args.db_uri or None)
 
 
 def main():
@@ -35,14 +44,12 @@ def main():
     syncer.add_argument(
         "--db-uri",
         dest="db_uri",
-        required=False,
         help="the database connection string eg. postgresql://user:pass@host:port/database",
     )
-    syncer.set_defaults(
-        func=lambda args: synchronize(
-            args.source, args.target, db_uri=args.db_uri or None
-        )
+    syncer.add_argument(
+        "--verbose", action="store_const", const=True, help="enable verbose logging"
     )
+    syncer.set_defaults(func=schema_sync)
 
     args = parser.parse_args()
     args.func(args)
